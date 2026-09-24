@@ -1,0 +1,1356 @@
+# ============================================================
+# POWER ANALYSIS: WITHIN-BEACH ARTIFICIAL LIGHT AND
+# SEA TURTLE EMERGENCE ORIENTATION
+#
+# Purpose:
+# Estimate the number of emergence events and beaches
+# required to detect different magnitudes of association
+# between within-beach artificial-light exposure and
+# orientation offset.
+#
+# Analysis:
+#   OFFSET_GAMMA ~ ALAN_within +
+#                  ALAN_beach_mean +
+#                  Moon_Ill +
+#                  (1 | Beach)
+#
+# Response:
+#   Corrected orientation offset (degrees)
+#
+# Distribution:
+#   Gamma with log link
+#
+# Power:
+#   Proportion of simulated datasets in which the
+#   ALAN_within coefficient has p < 0.05.
+#
+# Author: Lauren [add surname]
+# Project: MSc Marine Biology
+# Repository:
+# https://github.com/Lauren-Millie/Msc_Turtle_Thesis
+#
+# ============================================================
+
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+
+library(dplyr)
+library(glmmTMB)
+library(ggplot2)
+
+
+# ============================================================
+# 2. USER SETTINGS
+# ============================================================
+
+# ------------------------------------------------------------
+# IMPORTANT:
+# Change this to the location/name of the dataset used for
+# the ALAN analysis.
+#
+# The dataset must contain:
+#
+#   Beach
+#   Brightest_VIIRS
+#   Moon_Ill
+#   OFFSET_CORRECTED
+#
+# ------------------------------------------------------------
+
+data_file <- "alan_power.csv"
+
+
+# ------------------------------------------------------------
+# Number of simulations
+#
+# Use 200 while testing the script.
+# Use 2000 or more for the final analysis.
+# ------------------------------------------------------------
+
+N_SIMULATIONS <- 2000
+
+
+# ------------------------------------------------------------
+# Significance level
+# ------------------------------------------------------------
+
+ALPHA <- 0.05
+
+
+# ------------------------------------------------------------
+# Power threshold
+#
+# 80% is used as the conventional primary target.
+# ------------------------------------------------------------
+
+POWER_TARGET <- 0.80
+
+
+# ------------------------------------------------------------
+# Random seed
+#
+# Makes the simulation reproducible.
+# ------------------------------------------------------------
+
+SEED <- 123
+
+
+# ============================================================
+# 3. LOAD DATA
+# ============================================================
+
+alan_power <- read.csv(
+  data_file,
+  stringsAsFactors = FALSE
+)
+
+
+# ============================================================
+# 4. CHECK REQUIRED VARIABLES
+# ============================================================
+
+required_variables <- c(
+  "Beach",
+  "Brightest_VIIRS",
+  "Moon_Ill",
+  "OFFSET_CORRECTED"
+)
+
+missing_variables <- setdiff(
+  required_variables,
+  names(alan_power)
+)
+
+if (length(missing_variables) > 0) {
+  
+  stop(
+    paste0(
+      "The following required variables are missing: ",
+      paste(
+        missing_variables,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+# ============================================================
+# 5. PREPARE DATA
+# ============================================================
+
+alan_power <- alan_power %>%
+  
+  filter(
+    !is.na(OFFSET_CORRECTED),
+    !is.na(Brightest_VIIRS),
+    !is.na(Moon_Ill),
+    !is.na(Beach)
+  ) %>%
+  
+  mutate(
+    
+    # Gamma distributions cannot contain zero.
+    #
+    # The original OFFSET_CORRECTED values are retained.
+    # 0.001 is used only as a modelling value for zero
+    # observations in the Gamma simulation.
+    
+    OFFSET_GAMMA = ifelse(
+      OFFSET_CORRECTED == 0,
+      0.001,
+      OFFSET_CORRECTED
+    ),
+    
+    Beach = as.character(Beach)
+    
+  )
+
+
+# ============================================================
+# 6. CALCULATE WITHIN- AND BETWEEN-BEACH ALAN
+# ============================================================
+
+alan_power <- alan_power %>%
+  
+  group_by(Beach) %>%
+  
+  mutate(
+    
+    # Mean ALAN exposure for each beach
+    ALAN_beach_mean =
+      mean(
+        Brightest_VIIRS,
+        na.rm = TRUE
+      ),
+    
+    # Difference between each emergence event and
+    # its beach's mean ALAN exposure
+    ALAN_within =
+      Brightest_VIIRS -
+      ALAN_beach_mean
+    
+  ) %>%
+  
+  ungroup()
+
+
+# ============================================================
+# 7. FIT OBSERVED MODEL
+# ============================================================
+
+observed_model <- glmmTMB(
+  
+  OFFSET_GAMMA ~
+    ALAN_within +
+    ALAN_beach_mean +
+    Moon_Ill +
+    (1 | Beach),
+  
+  data = alan_power,
+  
+  family = Gamma(
+    link = "log"
+  )
+)
+
+
+# Display observed model
+summary(observed_model)
+
+
+# ============================================================
+# 8. EXTRACT PARAMETERS FOR SIMULATION
+# ============================================================
+
+# ------------------------------------------------------------
+# Fixed effects
+# ------------------------------------------------------------
+
+observed_coefficients <-
+  fixef(observed_model)$cond
+
+observed_intercept <-
+  observed_coefficients["(Intercept)"]
+
+observed_beta_within <-
+  observed_coefficients["ALAN_within"]
+
+observed_beta_between <-
+  observed_coefficients["ALAN_beach_mean"]
+
+observed_beta_moon <-
+  observed_coefficients["Moon_Ill"]
+
+
+# ------------------------------------------------------------
+# Beach random-effect standard deviation
+# ------------------------------------------------------------
+
+beach_sd <-
+  as.numeric(
+    attr(
+      VarCorr(observed_model)$cond$Beach,
+      "stddev"
+    )
+  )
+
+
+# ------------------------------------------------------------
+# Gamma dispersion
+# ------------------------------------------------------------
+
+gamma_dispersion <-
+  sigma(observed_model)^2
+
+
+# Display parameters
+cat("\nObserved model parameters:\n")
+
+cat(
+  "Intercept:",
+  observed_intercept,
+  "\n"
+)
+
+cat(
+  "Within-beach ALAN beta:",
+  observed_beta_within,
+  "\n"
+)
+
+cat(
+  "Between-beach ALAN beta:",
+  observed_beta_between,
+  "\n"
+)
+
+cat(
+  "Moon illumination beta:",
+  observed_beta_moon,
+  "\n"
+)
+
+cat(
+  "Beach random-effect SD:",
+  beach_sd,
+  "\n"
+)
+
+cat(
+  "Gamma dispersion:",
+  gamma_dispersion,
+  "\n"
+)
+
+
+# ============================================================
+# 9. DEFINE BIOLOGICALLY INTERPRETABLE EFFECT SCENARIOS
+# ============================================================
+
+# ------------------------------------------------------------
+# Baseline orientation offset
+#
+# Median observed nocturnal orientation offset.
+# ------------------------------------------------------------
+
+baseline_offset <-
+  median(
+    alan_power$OFFSET_CORRECTED,
+    na.rm = TRUE
+  )
+
+
+# ------------------------------------------------------------
+# Define realistic within-beach ALAN contrast
+#
+# We use the 10th and 90th percentiles of ALAN_within.
+# ------------------------------------------------------------
+
+ALAN_within_low <-
+  quantile(
+    alan_power$ALAN_within,
+    probs = 0.10,
+    na.rm = TRUE
+  )
+
+ALAN_within_high <-
+  quantile(
+    alan_power$ALAN_within,
+    probs = 0.90,
+    na.rm = TRUE
+  )
+
+
+ALAN_contrast <-
+  as.numeric(
+    ALAN_within_high -
+    ALAN_within_low
+  )
+
+
+cat(
+  "\nRealistic within-beach ALAN contrast:",
+  ALAN_contrast,
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# Candidate biological effect magnitudes
+#
+# These are not established biological thresholds.
+# They are sensitivity scenarios representing different
+# possible increases in expected orientation offset.
+# ------------------------------------------------------------
+
+effect_degrees <- c(
+  5,
+  10,
+  15,
+  20
+)
+
+
+# ------------------------------------------------------------
+# Convert angular effect to model coefficient
+#
+# Because the Gamma model uses a log link:
+#
+#   beta =
+#     log(high expected offset /
+#         low expected offset) /
+#     ALAN contrast
+#
+# ------------------------------------------------------------
+
+effect_scenarios <- data.frame(
+  
+  effect_degrees =
+    effect_degrees
+  
+)
+
+
+effect_scenarios$low_offset <-
+  baseline_offset
+
+
+effect_scenarios$high_offset <-
+  baseline_offset +
+  effect_scenarios$effect_degrees
+
+
+effect_scenarios$beta <-
+  log(
+    effect_scenarios$high_offset /
+    effect_scenarios$low_offset
+  ) /
+  ALAN_contrast
+
+
+# Display effect scenarios
+cat("\nEffect scenarios:\n")
+
+print(
+  effect_scenarios
+)
+
+
+# ============================================================
+# 10. SIMULATION FUNCTION
+# ============================================================
+
+simulate_power_within <- function(
+    
+    n_beaches,
+    
+    n_per_beach,
+    
+    beta_within,
+    
+    nsim = 2000,
+    
+    seed = 123
+    
+) {
+  
+  
+  # ----------------------------------------------------------
+  # Set seed
+  # ----------------------------------------------------------
+  
+  set.seed(seed)
+  
+  
+  # ----------------------------------------------------------
+  # Observed beach-level ALAN
+  # ----------------------------------------------------------
+  
+  beach_data <- alan_power %>%
+    
+    group_by(Beach) %>%
+    
+    summarise(
+      
+      ALAN_mean =
+        mean(
+          Brightest_VIIRS,
+          na.rm = TRUE
+        ),
+      
+      .groups = "drop"
+      
+    )
+  
+  
+  # ----------------------------------------------------------
+  # Available beaches
+  # ----------------------------------------------------------
+  
+  available_beaches <-
+    beach_data$Beach
+  
+  
+  if (
+    n_beaches >
+    length(available_beaches)
+  ) {
+    
+    stop(
+      paste0(
+        "Requested ",
+        n_beaches,
+        " beaches, but only ",
+        length(available_beaches),
+        " beaches are available."
+      )
+    )
+    
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Observed within-beach ALAN variation
+  # ----------------------------------------------------------
+  
+  within_pool <-
+    alan_power$ALAN_within
+  
+  within_pool <-
+    within_pool[
+      is.finite(within_pool)
+    ]
+  
+  
+  # ----------------------------------------------------------
+  # Store p-values
+  # ----------------------------------------------------------
+  
+  p_values <-
+    numeric(nsim)
+  
+  
+  # ----------------------------------------------------------
+  # Select beaches
+  # ----------------------------------------------------------
+  
+  selected_beaches <-
+    sample(
+      available_beaches,
+      size = n_beaches,
+      replace = FALSE
+    )
+  
+  
+  selected_beach_data <-
+    beach_data %>%
+    
+    filter(
+      Beach %in%
+        selected_beaches
+    )
+  
+  
+  # ==========================================================
+  # SIMULATION LOOP
+  # ==========================================================
+  
+  for (
+    i in seq_len(nsim)
+  ) {
+    
+    
+    # --------------------------------------------------------
+    # Create sampling design
+    # --------------------------------------------------------
+    
+    sim_data <-
+      expand.grid(
+        
+        Beach =
+          selected_beaches,
+        
+        Event =
+          seq_len(
+            n_per_beach
+          )
+        
+      ) %>%
+      
+      left_join(
+        selected_beach_data,
+        by = "Beach"
+      )
+    
+    
+    # --------------------------------------------------------
+    # Simulate within-beach ALAN
+    # --------------------------------------------------------
+    
+    sim_data$ALAN_within <-
+      sample(
+        
+        within_pool,
+        
+        size =
+          nrow(sim_data),
+        
+        replace = TRUE
+        
+      )
+    
+    
+    # --------------------------------------------------------
+    # Assign observed beach-level ALAN
+    # --------------------------------------------------------
+    
+    sim_data$ALAN_beach_mean <-
+      sim_data$ALAN_mean
+    
+    
+    # --------------------------------------------------------
+    # Reconstruct total ALAN
+    # --------------------------------------------------------
+    
+    sim_data$ALAN <-
+      
+      sim_data$ALAN_beach_mean +
+      
+      sim_data$ALAN_within
+    
+    
+    # --------------------------------------------------------
+    # Prevent negative radiance
+    # --------------------------------------------------------
+    
+    sim_data$ALAN[
+      sim_data$ALAN <= 0
+    ] <- 0.01
+    
+    
+    # --------------------------------------------------------
+    # Recalculate within-beach ALAN
+    # --------------------------------------------------------
+    
+    sim_data <-
+      sim_data %>%
+      
+      group_by(Beach) %>%
+      
+      mutate(
+        
+        ALAN_beach_mean =
+          mean(
+            ALAN
+          ),
+        
+        ALAN_within =
+          ALAN -
+          ALAN_beach_mean
+        
+      ) %>%
+      
+      ungroup()
+    
+    
+    # --------------------------------------------------------
+    # Simulate moon illumination
+    # --------------------------------------------------------
+    
+    sim_data$Moon_Ill <-
+      sample(
+        
+        alan_power$Moon_Ill,
+        
+        size =
+          nrow(sim_data),
+        
+        replace = TRUE
+        
+      )
+    
+    
+    # --------------------------------------------------------
+    # Simulate beach random effects
+    # --------------------------------------------------------
+    
+    beach_effects <-
+      rnorm(
+        
+        n_beaches,
+        
+        mean = 0,
+        
+        sd = beach_sd
+        
+      )
+    
+    
+    names(
+      beach_effects
+    ) <-
+      selected_beaches
+    
+    
+    # IMPORTANT:
+    # Convert Beach to character before matching.
+    
+    sim_data$Beach_RE <-
+      beach_effects[
+        as.character(
+          sim_data$Beach
+        )
+      ]
+    
+    
+    # --------------------------------------------------------
+    # Check random effects
+    # --------------------------------------------------------
+    
+    if (
+      any(
+        !is.finite(
+          sim_data$Beach_RE
+        )
+      )
+    ) {
+      
+      p_values[i] <- NA
+      
+      next
+      
+    }
+    
+    
+    # --------------------------------------------------------
+    # Linear predictor
+    #
+    # IMPORTANT:
+    #
+    # The between-beach ALAN coefficient is set to ZERO.
+    #
+    # This means this power analysis specifically evaluates
+    # the ability to detect the within-beach ALAN effect.
+    # --------------------------------------------------------
+    
+    eta <-
+      
+      observed_intercept +
+      
+      beta_within *
+      sim_data$ALAN_within +
+      
+      0 *
+      sim_data$ALAN_beach_mean +
+      
+      observed_beta_moon *
+      sim_data$Moon_Ill +
+      
+      sim_data$Beach_RE
+    
+    
+    # --------------------------------------------------------
+    # Expected orientation offset
+    # --------------------------------------------------------
+    
+    mu <-
+      exp(eta)
+    
+    
+    # --------------------------------------------------------
+    # Check expected values
+    # --------------------------------------------------------
+    
+    if (
+      any(
+        !is.finite(mu)
+      )
+    ) {
+      
+      p_values[i] <- NA
+      
+      next
+      
+    }
+    
+    
+    # --------------------------------------------------------
+    # Gamma parameters
+    # --------------------------------------------------------
+    
+    shape <-
+      1 /
+      gamma_dispersion
+    
+    
+    scale <-
+      mu *
+      gamma_dispersion
+    
+    
+    # --------------------------------------------------------
+    # Check Gamma parameters
+    # --------------------------------------------------------
+    
+    if (
+      
+      any(
+        !is.finite(scale)
+      ) ||
+      
+      any(
+        scale <= 0
+      )
+      
+    ) {
+      
+      p_values[i] <- NA
+      
+      next
+      
+    }
+    
+    
+    # --------------------------------------------------------
+    # Simulate orientation offset
+    # --------------------------------------------------------
+    
+    sim_data$OFFSET_GAMMA <-
+      
+      rgamma(
+        
+        nrow(sim_data),
+        
+        shape =
+          shape,
+        
+        scale =
+          scale
+        
+      )
+    
+    
+    # --------------------------------------------------------
+    # Check simulated response
+    # --------------------------------------------------------
+    
+    if (
+      any(
+        !is.finite(
+          sim_data$OFFSET_GAMMA
+        )
+      )
+    ) {
+      
+      p_values[i] <- NA
+      
+      next
+      
+    }
+    
+    
+    # --------------------------------------------------------
+    # Fit the same model used for the observed data
+    # --------------------------------------------------------
+    
+    fit <-
+      try(
+        
+        suppressWarnings(
+          
+          glmmTMB(
+            
+            OFFSET_GAMMA ~
+              
+              ALAN_within +
+              
+              ALAN_beach_mean +
+              
+              Moon_Ill +
+              
+              (1 | Beach),
+            
+            data =
+              sim_data,
+            
+            family =
+              Gamma(
+                link = "log"
+              )
+            
+          )
+          
+        ),
+        
+        silent = TRUE
+        
+      )
+    
+    
+    # --------------------------------------------------------
+    # Extract p-value for within-beach ALAN
+    # --------------------------------------------------------
+    
+    if (
+      !inherits(
+        fit,
+        "try-error"
+      )
+    ) {
+      
+      coef_table <-
+        summary(
+          fit
+        )$coefficients$cond
+      
+      
+      if (
+        "ALAN_within" %in%
+        rownames(
+          coef_table
+        )
+      ) {
+        
+        p_values[i] <-
+          
+          coef_table[
+            "ALAN_within",
+            "Pr(>|z|)"
+          ]
+        
+      } else {
+        
+        p_values[i] <- NA
+        
+      }
+      
+    } else {
+      
+      p_values[i] <- NA
+      
+    }
+    
+  }
+  
+  
+  # ==========================================================
+  # SUMMARISE SIMULATIONS
+  # ==========================================================
+  
+  simulations_failed <-
+    sum(
+      is.na(
+        p_values
+      )
+    )
+  
+  
+  simulations_completed <-
+    sum(
+      !is.na(
+        p_values
+      )
+    )
+  
+  
+  # ----------------------------------------------------------
+  # Calculate power
+  # ----------------------------------------------------------
+  
+  if (
+    simulations_completed == 0
+  ) {
+    
+    power <- NA
+    
+  } else {
+    
+    power <-
+      
+      mean(
+        
+        p_values[
+          !is.na(
+            p_values
+          )
+        ] <
+          ALPHA
+        
+      )
+    
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Return results
+  # ----------------------------------------------------------
+  
+  data.frame(
+    
+    n_beaches =
+      n_beaches,
+    
+    n_per_beach =
+      n_per_beach,
+    
+    total_events =
+      n_beaches *
+      n_per_beach,
+    
+    beta_within =
+      beta_within,
+    
+    simulations_requested =
+      nsim,
+    
+    simulations_completed =
+      simulations_completed,
+    
+    simulations_failed =
+      simulations_failed,
+    
+    power =
+      power
+    
+  )
+  
+}
+
+
+# ============================================================
+# 11. DEFINE SAMPLING DESIGNS
+# ============================================================
+
+# ------------------------------------------------------------
+# These designs represent different combinations of:
+#
+#   number of beaches
+#   emergence events per beach
+#
+# The current ALAN dataset contains 17 beaches.
+# ------------------------------------------------------------
+
+designs <- expand.grid(
+  
+  n_beaches =
+    c(
+      5,
+      10,
+      15,
+      17
+    ),
+  
+  n_per_beach =
+    c(
+      5,
+      10,
+      15,
+      20
+    )
+  
+)
+
+
+designs$total_events <-
+  
+  designs$n_beaches *
+  designs$n_per_beach
+
+
+designs <-
+  designs[
+    order(
+      designs$total_events,
+      designs$n_beaches
+    ),
+  ]
+
+
+# ============================================================
+# 12. RUN POWER ANALYSIS
+# ============================================================
+
+power_results <- list()
+
+counter <- 1
+
+
+for (
+  i in seq_len(
+    nrow(effect_scenarios)
+  )
+) {
+  
+  
+  effect <-
+    effect_scenarios$
+    effect_degrees[i]
+  
+  
+  beta <-
+    effect_scenarios$
+    beta[i]
+  
+  
+  for (
+    j in seq_len(
+      nrow(designs)
+    )
+  ) {
+    
+    
+    cat(
+      
+      "\nRunning:",
+      
+      effect,
+      
+      "degree effect |",
+      
+      designs$n_beaches[j],
+      
+      "beaches ×",
+      
+      designs$n_per_beach[j],
+      
+      "events"
+      
+    )
+    
+    
+    result <-
+      
+      simulate_power_within(
+        
+        n_beaches =
+          designs$n_beaches[j],
+        
+        n_per_beach =
+          designs$n_per_beach[j],
+        
+        beta_within =
+          beta,
+        
+        nsim =
+          N_SIMULATIONS,
+        
+        seed =
+          SEED +
+          counter
+        
+      )
+    
+    
+    result$effect_degrees <-
+      effect
+    
+    
+    result$effect_name <-
+      paste0(
+        effect,
+        " degree effect"
+      )
+    
+    
+    power_results[
+      [counter]
+    ] <-
+      result
+    
+    
+    counter <-
+      counter +
+      1
+    
+  }
+}
+
+
+# Combine results
+power_results <-
+  bind_rows(
+    power_results
+  )
+
+
+# ============================================================
+# 13. VIEW RESULTS
+# ============================================================
+
+print(
+  power_results %>%
+    
+    select(
+      effect_degrees,
+      n_beaches,
+      n_per_beach,
+      total_events,
+      beta_within,
+      simulations_completed,
+      simulations_failed,
+      power
+    ) %>%
+    
+    arrange(
+      effect_degrees,
+      total_events
+    )
+)
+
+
+# ============================================================
+# 14. IDENTIFY DESIGNS REACHING 80% POWER
+# ============================================================
+
+power_80 <-
+  
+  power_results %>%
+  
+  filter(
+    power >= POWER_TARGET
+  ) %>%
+  
+  group_by(
+    effect_degrees
+  ) %>%
+  
+  arrange(
+    total_events,
+    n_beaches
+  ) %>%
+  
+  slice(1) %>%
+  
+  ungroup()
+
+
+cat(
+  "\n\nMinimum tested designs reaching",
+  POWER_TARGET * 100,
+  "% power:\n"
+)
+
+
+print(
+  power_80 %>%
+    
+    select(
+      effect_degrees,
+      n_beaches,
+      n_per_beach,
+      total_events,
+      power
+    )
+)
+
+
+# ============================================================
+# 15. POWER CURVE
+# ============================================================
+
+power_plot <-
+  
+  ggplot(
+    
+    power_results,
+    
+    aes(
+      
+      x =
+        total_events,
+      
+      y =
+        power,
+      
+      colour =
+        factor(
+          effect_degrees
+        ),
+      
+      group =
+        interaction(
+          effect_degrees,
+          n_beaches
+        )
+      
+    )
+    
+  ) +
+  
+  geom_line() +
+  
+  geom_point() +
+  
+  geom_hline(
+    
+    yintercept =
+      POWER_TARGET,
+    
+    linetype =
+      "dashed"
+    
+  ) +
+  
+  scale_y_continuous(
+    
+    limits =
+      c(
+        0,
+        1
+      )
+    
+  ) +
+  
+  labs(
+    
+    x =
+      "Total emergence events",
+    
+    y =
+      "Estimated power",
+    
+    colour =
+      "Orientation-offset effect (degrees)"
+    
+  ) +
+  
+  theme_classic()
+print(
+  power_plot
+)
+# ============================================================
+# 16. SAVE RESULTS
+# ============================================================
+
+write.csv(
+  
+  effect_scenarios,
+  
+  "power_effect_scenarios_within_beach.csv",
+  
+  row.names = FALSE
+)
+write.csv(
+  
+  power_results,
+  
+  "power_results_within_beach.csv",
+  
+  row.names = FALSE
+  
+)
+write.csv(
+  
+  power_80,
+  
+  "power_80_percent_designs_within_beach.csv",
+  
+  row.names = FALSE
+  
+)
+
+
+ggsave(
+  
+  "power_curve_within_beach.png",
+  
+  plot =
+    power_plot,
+  
+  width =
+    8,
+  
+  height =
+    6,
+  
+  dpi =
+    300
+  
+)
+
+# ============================================================
+# END OF SCRIPT
+# ============================================================

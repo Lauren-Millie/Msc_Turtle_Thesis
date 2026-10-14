@@ -47,12 +47,55 @@ If individual pixels within a 3 × 3 grid contain NoData, those pixels remain in
 
 If all nine pixels are NoData, the emergence observation remains in the detailed 3 × 3 dataset but is excluded from the brightest-pixel analysis because a brightest surrounding pixel cannot be identified.
 
+SUNSHINE COAST LOGGERHEAD HATCHLING: 250 m SPATIAL SCENARIO ANALYSIS
+===================================================================
+Reconstructed, annotated PyQGIS workflow for a thesis methods repository.
+
+IMPORTANT PROVENANCE
+--------------------
+This script consolidates the documented workflow and final manual QC decisions.
+It is a RECONSTRUCTION, not a verbatim archive of every interactive QGIS script
+used during the original analysis. Run only on a COPY of the project and inspect
+outputs before replacing any archived thesis results.
+
+Research units:
+  * 22 named beaches, 24 physical coastal sections (Noosa and Bribie split).
+  * Dune edge and shoreline proxy digitised manually for each section.
+  * CRS EPSG:7856 (GDA2020 / MGA zone 56), distances in metres.
+  * 250 m refers to along-dune systematic sampling spacing.
+  * 500 m refers separately to the maximum direct-route search distance.
+  * 5 m is a provisional habitat-boundary digitising tolerance, NOT a
+    biological threshold or a measured mapping-error estimate.
+
+Original run, AFTER documented manual QC:
+  281 starting points x 15 orientations = 4,215 modelled trajectories.
+  3,197 valid direct routes; 160 habitat crossing / reorientation required;
+  858 without shoreline intersection within 500 m.
+  330 beach x orientation summary rows (22 x 15).
+
+Manual interpretation remains necessary. In particular, a line being within a
+buffered sandy-beach polygon does not prove it is traversable by a hatchling.
+This is a geometric scenario model, not observed hatchling movement.
+
+REQUIREMENTS
+------------
+Run in QGIS Python Editor (not standalone Python). QGIS 3.x, PyQGIS available.
+The open project must contain all 24 pairs of layers named:
+    <Section>_Dune_Edge
+    <Section>_Shoreline
+Each layer must have one polyline feature. Polygons may instead be supplied
+using the existing All_Beach_Polygons_REVIEW layer, but by default this script
+rebuilds them from the line layers as documented.
+
+
 ## Repository structure
 
 ```text
 Msc_Turtle_Thesis/
 │
 ├── README.md
+│
+├── Power Analysis
 │
 ├── data/
 │   └── VIIRS_data_manifest.csv

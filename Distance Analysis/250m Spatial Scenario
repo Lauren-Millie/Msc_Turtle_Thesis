@@ -1,0 +1,721 @@
+import math
+from collections import defaultdict, Counter
+from statistics import mean
+
+from qgis.core import (
+    QgsProject, QgsVectorLayer, QgsFeature, QgsField, QgsGeometry,
+    QgsPointXY, QgsWkbTypes, QgsCoordinateReferenceSystem,
+    QgsVectorFileWriter, NULL
+)
+from qgis.PyQt.QtCore import QVariant
+
+# ============================================================================
+# 0. USER SETTINGS AND REPRODUCIBILITY
+# ============================================================================
+
+PROJECT = QgsProject.instance()
+CRS = QgsCoordinateReferenceSystem("EPSG:7856")
+SAMPLE_INTERVAL_M = 250.0
+SEARCH_LENGTH_M = 5000.0     # Only to find possible geometric intersections
+MAX_DIRECT_ROUTE_M = 500.0  # Analysis cutoff, NOT biological crawl limit
+HABITAT_TOLERANCE_M = 5.0    # Pragmatic mapping tolerance
+QC_INITIAL_TOLERANCE_M = 2.0 # Used in original Noosa_1 pilot
+
+# Leave blank for in-memory outputs. To write a NEW gpkg, set e.g.
+# OUTPUT_GPKG = r"C:\path\to\new_reconstructed_250m.gpkg"
+OUTPUT_GPKG = ""
+
+# When True, automatically apply the one documented river-mouth rejection.
+# The other 19 cross-section routes are retained only if geometry passes.
+APPLY_DOCUMENTED_MANUAL_QC = True
+
+# Optional: compare against historical final counts. These are not hard-coded
+# into the calculations; any discrepancy is reported, not silently corrected.
+EXPECTED = {"points": 281, "rays": 4215, "valid": 3197,
+            "habitat": 160, "no_intersection": 858, "summary": 330}
+
+# Replace this list only if the underlying section inventory changes.
+SECTIONS = [
+    "Alexandra_Bay", "Bokarina", "Bribie_1", "Bribie_2", "Buddina",
+    "Coolum", "Currimundi", "Dicky", "Marcoola", "Marcus",
+    "Maroochydore", "Moffat", "Mooloolaba", "Mudjimba",
+    "Noosa_1", "Noosa_2", "Peregian", "Shelly", "Sunrise",
+    "Sunshine", "TwinWaters", "Warana", "Wurtulla", "Yaroomba"
+]
+
+# There are 15 orientations: baseline + seven clockwise and seven
+# anticlockwise deviations. Bearings are clockwise from geographic north.
+ANGLES = [15, 45, 55, 65, 75, 85, 105]
+ORIENTATIONS = [(0, "Baseline", 0.0)]
+for angle in ANGLES:
+    ORIENTATIONS.extend([
+        (angle, "Clockwise", +float(angle)),
+        (angle, "Anticlockwise", -float(angle))
+    ])
+
+# Manual QC observations documented in the interactive analysis.
+# 'accept' = visually assessed as continuous sandy habitat.
+# 'reject' = visually assessed as crossing unsuitable habitat.
+# The 3 invalid baseline routes are retained as algorithmic exclusions,
+# NOT overridden to valid.
+MANUAL_CROSS_SECTION_QC = {
+    ("Bokarina_009", 85, "Clockwise"): ("accept", "Continuous sand"),
+    ("Wurtulla_001", 85, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Coolum_001", 85, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Peregian_022", 85, "Clockwise"): ("accept", "Continuous sand"),
+    ("Currimundi_001", 85, "Anticlockwise"):
+        ("reject", "River mouth crossing; visual QC"),
+    ("Currimundi_007", 65, "Clockwise"): ("accept", "Continuous sand"),
+    ("Dicky_001", 85, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Marcoola_001", 85, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Marcoola_002", 85, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Marcus_001", 85, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Moffat_001", 75, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Mudjimba_001", 75, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Mudjimba_013", 75, "Clockwise"): ("accept", "Continuous sand"),
+    ("Mudjimba_013", 85, "Clockwise"): ("accept", "Continuous sand"),
+    ("Sunrise_001", 75, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Sunrise_007", 85, "Clockwise"): ("accept", "Continuous sand"),
+    ("Sunshine_011", 85, "Clockwise"): ("accept", "Continuous sand"),
+    ("TwinWaters_001", 85, "Anticlockwise"): ("accept", "Continuous sand"),
+    ("Yaroomba_014", 75, "Clockwise"): ("accept", "Continuous sand"),
+    ("Yaroomba_014", 85, "Clockwise"): ("accept", "Continuous sand")
+}
+
+MANUAL_BASELINE_EXCLUSIONS = {
+    "Bokarina_008": "Visual QC confirmed unsuitable habitat; max outside ~8.04 m",
+    "Coolum_008": "Visual QC confirmed unsuitable habitat; max outside ~6.36 m",
+    "Currimundi_005": "Visual QC confirmed unsuitable habitat; max outside ~6.35 m"
+}
+
+STATUS_VALID = "Valid"
+STATUS_HABITAT = "Reorientation required / habitat crossing"
+STATUS_NO_INTERSECTION = "No shoreline intersection within 500 m"
+
+# ============================================================================
+# 1. COMMON UTILITIES
+# ============================================================================
+
+def unique_layer(name):
+    found = PROJECT.mapLayersByName(name)
+    if len(found) != 1:
+        raise RuntimeError("Expected exactly one project layer '%s'; found %s" %
+                           (name, len(found)))
+    return found[0]
+
+
+def check_line_layer(layer, name):
+    if not layer.isValid() or layer.crs() != CRS:
+        raise RuntimeError("Invalid or wrong CRS for %s; expected EPSG:7856" % name)
+    feats = list(layer.getFeatures())
+    if len(feats) != 1:
+        raise RuntimeError("%s must contain exactly one feature" % name)
+    geom = QgsGeometry(feats[0].geometry())
+    if QgsWkbTypes.geometryType(geom.wkbType()) != QgsWkbTypes.LineGeometry:
+        raise RuntimeError("%s is not a line geometry" % name)
+    if geom.isMultipart():
+        raise RuntimeError("%s is multipart; manually resolve first" % name)
+    if geom.isEmpty() or geom.length() <= 0:
+        raise RuntimeError("%s has empty/zero-length geometry" % name)
+    return geom
+
+
+def memory_layer(kind, name, fields):
+    uri = kind if kind == "None" else "%s?crs=EPSG:7856" % kind
+    lyr = QgsVectorLayer(uri, name, "memory")
+    if not lyr.isValid():
+        raise RuntimeError("Could not create layer " + name)
+    lyr.dataProvider().addAttributes([QgsField(*spec) for spec in fields])
+    lyr.updateFields()
+    return lyr
+
+
+def add_record(layer, attributes, geometry=None):
+    f = QgsFeature(layer.fields())
+    f.setAttributes(attributes)
+    if geometry is not None:
+        f.setGeometry(geometry)
+    ok, _ = layer.dataProvider().addFeatures([f])
+    if not ok:
+        raise RuntimeError("Could not insert feature into " + layer.name())
+
+
+def distance_xy(a, b):
+    return math.hypot(a.x() - b.x(), a.y() - b.y())
+
+
+def bearing_north_clockwise(a, b):
+    # EPSG:7856 uses planar easting/northing. 0 = north; 90 = east.
+    return (math.degrees(math.atan2(b.x() - a.x(), b.y() - a.y())) + 360) % 360
+
+
+def ray_geometry(start, bearing_deg, length):
+    theta = math.radians(bearing_deg)
+    end = QgsPointXY(start.x() + length * math.sin(theta),
+                     start.y() + length * math.cos(theta))
+    return QgsGeometry.fromPolylineXY([QgsPointXY(start), end])
+
+
+def line_endpoints(geom):
+    pts = geom.asPolyline()
+    if len(pts) < 2:
+        raise RuntimeError("Line has fewer than two vertices")
+    return pts[0], pts[-1]
+
+
+def intersection_points(geom):
+    """Collect 0D points and endpoints of overlapping 1D intersections.
+
+    QgsGeometry.intersection may return Point, MultiPoint, LineString,
+    MultiLineString, or GeometryCollection. Overlapping line intersections
+    are ambiguous for first-contact interpretation and should be flagged.
+    """
+    if geom.isNull() or geom.isEmpty():
+        return []
+    flat = QgsWkbTypes.flatType(geom.wkbType())
+    if flat == QgsWkbTypes.Point:
+        return [QgsPointXY(geom.asPoint())]
+    if flat == QgsWkbTypes.MultiPoint:
+        return [QgsPointXY(p) for p in geom.asMultiPoint()]
+    if flat == QgsWkbTypes.LineString:
+        pts = geom.asPolyline()
+        return [QgsPointXY(pts[0]), QgsPointXY(pts[-1])] if pts else []
+    if flat == QgsWkbTypes.MultiLineString:
+        result = []
+        for pts in geom.asMultiPolyline():
+            if pts:
+                result.extend([QgsPointXY(pts[0]), QgsPointXY(pts[-1])])
+        return result
+    # GeometryCollection support varies across QGIS 3 releases.
+    if hasattr(geom, "asGeometryCollection"):
+        result = []
+        for part in geom.asGeometryCollection():
+            result.extend(intersection_points(part))
+        return result
+    return []
+
+
+def max_distance_outside_polygon(route, polygon, sample_step=1.0):
+    """Approximate maximum perpendicular distance outside ORIGINAL polygon.
+
+    Sampling at ~1 m intervals is a diagnostic, not a mathematically exact
+    supremum. Polygon.distance(point) is zero inside and positive outside.
+    """
+    n = max(1, int(math.ceil(route.length() / sample_step)))
+    return max(polygon.distance(route.interpolate(route.length() * i / n))
+               for i in range(n + 1))
+
+
+def normalised_beach(section):
+    if section.startswith("Noosa_"):
+        return "Noosa"
+    if section.startswith("Bribie_"):
+        return "Bribie"
+    return section
+
+# ============================================================================
+# 2. LOAD MANUALLY DIGITISED BOUNDARIES (INPUTS, NOT PYTHON OUTPUTS)
+# ============================================================================
+
+boundaries = {}
+for section in SECTIONS:
+    dune = check_line_layer(unique_layer(section + "_Dune_Edge"),
+                            section + "_Dune_Edge")
+    shore = check_line_layer(unique_layer(section + "_Shoreline"),
+                             section + "_Shoreline")
+    boundaries[section] = (dune, shore)
+
+print("Loaded %d dune-edge / shoreline pairs" % len(boundaries))
+
+# ============================================================================
+# 3. BUILD 24 SANDY-BEACH POLYGONS FROM PAIRED BOUNDARIES
+# ============================================================================
+
+polygon_fields = [
+    ("Section", QVariant.String), ("Area_m2", QVariant.Double),
+    ("End_1_m", QVariant.Double), ("End_2_m", QVariant.Double),
+    ("Valid", QVariant.Int)
+]
+beach_polygons = memory_layer("Polygon", "Rebuilt_Beach_Polygons_250m_REVIEW",
+                              polygon_fields)
+polygons_by_section = {}
+
+for section, (dune, shore) in boundaries.items():
+    d = [QgsPointXY(p) for p in dune.asPolyline()]
+    s = [QgsPointXY(p) for p in shore.asPolyline()]
+
+    # Choose shoreline vertex order minimising the two end connectors.
+    forward = distance_xy(d[-1], s[0]) + distance_xy(s[-1], d[0])
+    reverse = distance_xy(d[-1], s[-1]) + distance_xy(s[0], d[0])
+    if reverse < forward:
+        s.reverse()
+
+    end_1 = distance_xy(d[-1], s[0])
+    end_2 = distance_xy(s[-1], d[0])
+    ring = d + s + [d[0]]
+    geom = QgsGeometry.fromPolygonXY([ring])
+    is_valid = geom.isGeosValid()
+    if not is_valid:
+        raise RuntimeError("Invalid reconstructed polygon: " + section)
+    polygons_by_section[section] = geom
+    add_record(beach_polygons,
+               [section, geom.area(), end_1, end_2, int(is_valid)], geom)
+
+beach_polygons.updateExtents()
+combined_beach = QgsGeometry.unaryUnion(list(polygons_by_section.values()))
+if not combined_beach.isGeosValid():
+    raise RuntimeError("Combined polygon is invalid; inspect overlaps")
+allowed_habitat = combined_beach.buffer(HABITAT_TOLERANCE_M, 8)
+initial_habitat = combined_beach.buffer(QC_INITIAL_TOLERANCE_M, 8)
+
+# IMPORTANT: buffer on a union can bridge a narrow gap. We separately inspect
+# routes touching multiple original polygons, and manually check waterways.
+# Endpoint connectors can also create spurious sand: inspect all 24 polygons.
+
+# ============================================================================
+# 4. SYSTEMATIC MIDPOINT SAMPLING ALONG DUNE EDGES (250 m)
+# ============================================================================
+
+point_fields = [
+    ("Point_ID", QVariant.String), ("Beach", QVariant.String),
+    ("Section", QVariant.String), ("Position_m", QVariant.Double),
+    ("Interval_m", QVariant.Double)
+]
+points_layer = memory_layer("Point", "Rebuilt_Starting_Points_250m_REVIEW",
+                            point_fields)
+start_points = []
+
+for section in SECTIONS:
+    dune, shore = boundaries[section]
+    length = dune.length()
+    # Divide dune edge into ceil(length/250) equal subintervals, then sample
+    # at the midpoint of each. This is NOT fixed 250 m from the first point.
+    n = max(1, int(math.ceil(length / SAMPLE_INTERVAL_M)))
+    width = length / n
+    for index in range(n):
+        position = (index + 0.5) * width
+        point_geom = dune.interpolate(position)
+        p = QgsPointXY(point_geom.asPoint())
+        pid = "%s_%03d" % (section, index + 1)
+        add_record(points_layer, [pid, normalised_beach(section), section,
+                                  position, width], point_geom)
+        start_points.append((pid, section, p, position, width))
+
+points_layer.updateExtents()
+print("Generated starting points:", len(start_points))
+if len(start_points) != EXPECTED["points"]:
+    print("WARNING: historical result had 281 starting points; check source "
+          "boundary versions and the original sampling implementation.")
+
+# ============================================================================
+# 5. BASELINE = NEAREST POINT ON OWN SECTION'S SHORELINE
+# ============================================================================
+
+baseline_fields = [
+    ("Point_ID", QVariant.String), ("Beach", QVariant.String),
+    ("Section", QVariant.String), ("Baseline_m", QVariant.Double),
+    ("Bearing_deg", QVariant.Double)
+]
+baselines_layer = memory_layer("LineString", "Rebuilt_Baselines_250m_REVIEW",
+                               baseline_fields)
+baselines = {}
+
+for pid, section, start, position, width in start_points:
+    shore = boundaries[section][1]
+    nearest_geom = shore.nearestPoint(QgsGeometry.fromPointXY(start))
+    target = QgsPointXY(nearest_geom.asPoint())
+    baseline_m = distance_xy(start, target)
+    if baseline_m <= 0:
+        raise RuntimeError("Zero-length baseline: " + pid)
+    bearing = bearing_north_clockwise(start, target)
+    geom = QgsGeometry.fromPolylineXY([start, target])
+    baselines[pid] = (baseline_m, bearing, start, target)
+    add_record(baselines_layer,
+               [pid, normalised_beach(section), section, baseline_m, bearing],
+               geom)
+
+baselines_layer.updateExtents()
+
+# ============================================================================
+# 6. GENERATE 15 ORIENTATION SCENARIOS PER STARTING POINT
+# ============================================================================
+
+ray_fields = [
+    ("Point_ID", QVariant.String), ("Beach", QVariant.String),
+    ("Section", QVariant.String), ("Offset_deg", QVariant.Int),
+    ("Direction", QVariant.String), ("Bearing_deg", QVariant.Double),
+    ("Baseline_m", QVariant.Double)
+]
+rays_layer = memory_layer("LineString", "Rebuilt_Trajectories_250m_REVIEW",
+                          ray_fields)
+
+# Store ray metadata and geometry in memory; no provider subset filters used.
+rays = []
+for pid, section, start, _, _ in start_points:
+    baseline_m, baseline_bearing, _, target = baselines[pid]
+    for offset, direction, delta in ORIENTATIONS:
+        bearing = (baseline_bearing + delta) % 360
+        geom = ray_geometry(start, bearing, SEARCH_LENGTH_M)
+        meta = dict(Point_ID=pid, Beach=normalised_beach(section),
+                    Section=section, Offset_deg=offset,
+                    Direction=direction, Bearing_deg=bearing,
+                    Baseline_m=baseline_m, Start=start,
+                    Target=target, Geometry=geom)
+        rays.append(meta)
+        add_record(rays_layer,
+                   [pid, meta["Beach"], section, offset, direction,
+                    bearing, baseline_m], geom)
+
+rays_layer.updateExtents()
+print("Generated 5 km search rays:", len(rays))
+
+# ============================================================================
+# 7. FIND FIRST FORWARD INTERSECTION WITH ANY OF THE 24 SHORELINES
+# ============================================================================
+
+# NOTE: This searches all 24 shoreline proxies, not only the starting section.
+# The 5 km line is an intersection SEARCH device, not a plausible crawl length.
+# When a ray overlaps a shoreline for a non-zero length, first contact is
+# geometrically ambiguous and should be manually reviewed.
+
+intersection_fields = [
+    ("Point_ID", QVariant.String), ("Beach", QVariant.String),
+    ("Section", QVariant.String), ("Offset_deg", QVariant.Int),
+    ("Direction", QVariant.String), ("Baseline_m", QVariant.Double),
+    ("Travel_m", QVariant.Double), ("Additional_m", QVariant.Double),
+    ("Percent_Increase", QVariant.Double),
+    ("Intersect_Shore", QVariant.String), ("Status", QVariant.String)
+]
+intersection_layer = memory_layer("None", "Rebuilt_Intersections_250m_REVIEW",
+                                  intersection_fields)
+
+trim_fields = [
+    ("Point_ID", QVariant.String), ("Beach", QVariant.String),
+    ("Section", QVariant.String), ("Offset_deg", QVariant.Int),
+    ("Direction", QVariant.String), ("Travel_m", QVariant.Double),
+    ("Additional_m", QVariant.Double),
+    ("Intersect_Shore", QVariant.String)
+]
+trim_layer = memory_layer("LineString", "Rebuilt_Trimmed_250m_REVIEW",
+                          trim_fields)
+
+for ray in rays:
+    candidates = []
+    for section, (_, shore) in boundaries.items():
+        if not ray["Geometry"].intersects(shore):
+            continue
+        crossing = ray["Geometry"].intersection(shore)
+        for p in intersection_points(crossing):
+            # lineLocatePoint returns the position along the ray; ensures
+            # forward distance and avoids floating-point endpoint mismatch.
+            location = ray["Geometry"].lineLocatePoint(
+                QgsGeometry.fromPointXY(p))
+            if location >= -0.000001 and location <= SEARCH_LENGTH_M + 0.001:
+                candidates.append((max(0.0, location), section))
+
+    candidates.sort(key=lambda x: x[0])
+    if candidates:
+        travel_m, hit_section = candidates[0]
+        additional_m = travel_m - ray["Baseline_m"]
+        percent = 100 * additional_m / ray["Baseline_m"]
+        hit_status = "Intersection found"
+        trimmed = ray_geometry(ray["Start"], ray["Bearing_deg"], travel_m)
+        add_record(trim_layer,
+                   [ray["Point_ID"], ray["Beach"], ray["Section"],
+                    ray["Offset_deg"], ray["Direction"], travel_m,
+                    additional_m, hit_section], trimmed)
+    else:
+        travel_m = additional_m = percent = None
+        hit_section = None
+        hit_status = "No intersection within 5 km"
+
+    ray["Raw_Travel_m"] = travel_m
+    ray["Intersect_Shore"] = hit_section
+    ray["Intersection_Status"] = hit_status
+    add_record(intersection_layer,
+               [ray["Point_ID"], ray["Beach"], ray["Section"],
+                ray["Offset_deg"], ray["Direction"], ray["Baseline_m"],
+                travel_m, additional_m, percent, hit_section, hit_status])
+
+intersection_layer.updateExtents()
+trim_layer.updateExtents()
+print("Intersection found within 5 km:",
+      sum(r["Raw_Travel_m"] is not None for r in rays))
+
+# The original run yielded 3,540 intersections in 5 km, including 183 >500 m;
+# 675 rays did not intersect any shoreline in 5 km. After applying the 500 m
+# cutoff, 858 had no accepted intersection (183 + 675).
+# The original Noosa_1 2 m pilot flagged six routes:
+#   Noosa_1_002 85 Clockwise; Noosa_1_006 85 Anticlockwise;
+#   Noosa_1_007 85 Clockwise; Noosa_1_025 75 Anticlockwise;
+#   Noosa_1_025 85 Anticlockwise; Noosa_1_048 85 Clockwise.
+# Their sampled maximum outside distances were approximately 3.15, 4.56,
+# 3.60, 3.12, 7.47, 3.53 m respectively. At 5 m, five pass and one fails.
+# A 10 m sensitivity option was discussed but NOT adopted or run.
+
+# ============================================================================
+# 8. 500 m CUTOFF + HABITAT POLYGON TEST (5 m TOLERANCE)
+# ============================================================================
+
+result_fields = [
+    ("Point_ID", QVariant.String), ("Beach", QVariant.String),
+    ("Section", QVariant.String), ("Offset_deg", QVariant.Int),
+    ("Direction", QVariant.String), ("Bearing_deg", QVariant.Double),
+    ("Baseline_m", QVariant.Double), ("Travel_m", QVariant.Double),
+    ("Additional_m", QVariant.Double), ("Percent_Increase", QVariant.Double),
+    ("Raw_Travel_m", QVariant.Double), ("Intersect_Shore", QVariant.String),
+    ("Max_Outside_m", QVariant.Double), ("Status", QVariant.String),
+    ("QC_Review", QVariant.String)
+]
+results_layer = memory_layer("None", "Rebuilt_Distances_250m_REVIEW",
+                             result_fields)
+
+# Additional QC layers: 2 m pilot flags, cross-polygon accepted routes,
+# all 5 m habitat exclusions, and explicit manual decision register.
+flag_fields = [
+    ("Point_ID", QVariant.String), ("Section", QVariant.String),
+    ("Offset_deg", QVariant.Int), ("Direction", QVariant.String),
+    ("Travel_m", QVariant.Double), ("Max_Outside_m", QVariant.Double),
+    ("QC_Reason", QVariant.String)
+]
+flags_layer = memory_layer("LineString", "Rebuilt_Habitat_Flags_250m_REVIEW",
+                           flag_fields)
+noosa_2m_layer = memory_layer("LineString", "Rebuilt_Noosa_2m_Pilot_Flags_REVIEW",
+                              flag_fields)
+
+cross_fields = [
+    ("Point_ID", QVariant.String), ("Section", QVariant.String),
+    ("Offset_deg", QVariant.Int), ("Direction", QVariant.String),
+    ("Polygons_n", QVariant.Int), ("Polygons", QVariant.String),
+    ("QC_Decision", QVariant.String), ("QC_Reason", QVariant.String)
+]
+cross_layer = memory_layer("LineString", "Rebuilt_Cross_Beach_250m_REVIEW",
+                           cross_fields)
+
+qc_register_fields = [
+    ("Point_ID", QVariant.String), ("Offset_deg", QVariant.Int),
+    ("Direction", QVariant.String), ("Decision", QVariant.String),
+    ("Reason", QVariant.String)
+]
+qc_register = memory_layer("None", "Documented_Manual_QC_250m_REVIEW",
+                            qc_register_fields)
+
+for (pid, offset, direction), (decision, reason) in MANUAL_CROSS_SECTION_QC.items():
+    add_record(qc_register, [pid, offset, direction, decision, reason])
+for pid, reason in MANUAL_BASELINE_EXCLUSIONS.items():
+    add_record(qc_register, [pid, 0, "Baseline", "reject", reason])
+
+for ray in rays:
+    raw = ray["Raw_Travel_m"]
+    route = None
+    max_outside = None
+    travel = additional = percent = None
+    qc_reason = ""
+
+    if raw is None or raw > MAX_DIRECT_ROUTE_M:
+        status = STATUS_NO_INTERSECTION
+        qc_reason = "No first shoreline intersection within 500 m"
+    else:
+        route = ray_geometry(ray["Start"], ray["Bearing_deg"], raw)
+        max_outside = max_distance_outside_polygon(route, combined_beach)
+        # Compare 2 m and 5 m only as diagnostic; original Noosa_1 pilot
+        # flagged six at 2 m, five of which passed at 5 m.
+        if ray["Section"] == "Noosa_1" and not initial_habitat.contains(route):
+            add_record(noosa_2m_layer,
+                       [ray["Point_ID"], ray["Section"], ray["Offset_deg"],
+                        ray["Direction"], raw, max_outside,
+                        "Fails initial 2 m pilot"], route)
+
+        if allowed_habitat.contains(route):
+            status = STATUS_VALID
+            qc_reason = "Passed 5 m buffered habitat geometry test"
+        else:
+            status = STATUS_HABITAT
+            qc_reason = "Exceeds 5 m habitat tolerance"
+            add_record(flags_layer,
+                       [ray["Point_ID"], ray["Section"], ray["Offset_deg"],
+                        ray["Direction"], raw, max_outside, qc_reason], route)
+
+        # Identify any accepted geometric route intersecting >1 ORIGINAL
+        # polygon. Touching a boundary counts as intersection; inspect imagery.
+        crossed = [section for section, polygon in polygons_by_section.items()
+                   if route.intersects(polygon)]
+        key = (ray["Point_ID"], ray["Offset_deg"], ray["Direction"])
+        if status == STATUS_VALID and len(crossed) > 1:
+            decision, reason = MANUAL_CROSS_SECTION_QC.get(
+                key, ("unreviewed", "Needs visual satellite-imagery QC"))
+            add_record(cross_layer,
+                       [ray["Point_ID"], ray["Section"], ray["Offset_deg"],
+                        ray["Direction"], len(crossed), ", ".join(crossed),
+                        decision, reason], route)
+            if APPLY_DOCUMENTED_MANUAL_QC and decision == "reject":
+                status = STATUS_HABITAT
+                qc_reason = "Excluded: " + reason
+            elif decision == "unreviewed":
+                qc_reason += "; cross-section route needs manual review"
+
+        # Explicit visual rejection can be applied even if a regenerated
+        # polygon changes which cross-section routes are detected.
+        if APPLY_DOCUMENTED_MANUAL_QC and key in MANUAL_CROSS_SECTION_QC:
+            decision, reason = MANUAL_CROSS_SECTION_QC[key]
+            if decision == "reject" and status == STATUS_VALID:
+                status = STATUS_HABITAT
+                qc_reason = "Excluded: " + reason
+
+        # Baseline exclusions are expected to fail the geometric tolerance.
+        # Never force an unsuitable baseline to be valid merely because it is
+        # a reference route. Confirm these three in imagery if rerunning.
+        if ray["Offset_deg"] == 0 and ray["Point_ID"] in MANUAL_BASELINE_EXCLUSIONS:
+            if status == STATUS_VALID:
+                print("WARNING: previously excluded baseline now passes geometry:",
+                      ray["Point_ID"], "Inspect boundary version before accepting")
+            else:
+                qc_reason += "; confirmed by visual QC"
+
+        if status == STATUS_VALID:
+            travel = raw
+            additional = travel - ray["Baseline_m"]
+            percent = 100 * additional / ray["Baseline_m"]
+
+    add_record(results_layer,
+               [ray["Point_ID"], ray["Beach"], ray["Section"],
+                ray["Offset_deg"], ray["Direction"], ray["Bearing_deg"],
+                ray["Baseline_m"], travel, additional, percent, raw,
+                ray["Intersect_Shore"], max_outside, status, qc_reason])
+
+for layer in (results_layer, flags_layer, noosa_2m_layer, cross_layer, qc_register):
+    layer.updateExtents()
+
+# ============================================================================
+# 9. BEACH x ORIENTATION SUMMARY (22 BEACHES x 15 SCENARIOS)
+# ============================================================================
+
+summary_fields = [
+    ("Beach", QVariant.String), ("Offset_deg", QVariant.Int),
+    ("Direction", QVariant.String), ("Total_n", QVariant.Int),
+    ("Valid_n", QVariant.Int), ("Habitat_Cross_n", QVariant.Int),
+    ("No_Intersection_n", QVariant.Int), ("Valid_pct", QVariant.Double),
+    ("Mean_Baseline_m", QVariant.Double), ("Mean_Travel_m", QVariant.Double),
+    ("Mean_Additional_m", QVariant.Double),
+    ("Mean_Percent_Increase", QVariant.Double)
+]
+summary_layer = memory_layer("None", "Rebuilt_Beach_Orientation_250m_REVIEW",
+                             summary_fields)
+groups = defaultdict(list)
+for f in results_layer.getFeatures():
+    groups[(str(f["Beach"]), int(f["Offset_deg"]), str(f["Direction"]))].append(f)
+
+for (beach, offset, direction), records in sorted(groups.items()):
+    valid = [f for f in records if f["Status"] == STATUS_VALID]
+    habitat_n = sum(f["Status"] == STATUS_HABITAT for f in records)
+    no_hit_n = sum(f["Status"] == STATUS_NO_INTERSECTION for f in records)
+    def avg(field):
+        return mean(float(f[field]) for f in valid) if valid else None
+    add_record(summary_layer,
+               [beach, offset, direction, len(records), len(valid), habitat_n,
+                no_hit_n, 100 * len(valid) / len(records),
+                avg("Baseline_m"), avg("Travel_m"),
+                avg("Additional_m"), avg("Percent_Increase")])
+summary_layer.updateExtents()
+
+# ============================================================================
+# 10. FINAL QC: COUNTS, DISTANCE NULLS, BASELINE AND SUMMARY CONSISTENCY
+# ============================================================================
+
+rows = list(results_layer.getFeatures())
+counts = Counter(str(f["Status"]) for f in rows)
+assert len(rows) == len(start_points) * 15
+assert len(groups) == summary_layer.featureCount()
+assert len(rows) == sum(counts.values())
+
+for f in rows:
+    if f["Status"] == STATUS_VALID:
+        assert f["Travel_m"] is not None
+        assert f["Additional_m"] is not None
+        assert abs(float(f["Additional_m"]) -
+                   (float(f["Travel_m"]) - float(f["Baseline_m"]))) < 0.001
+    else:
+        # Nulls may be represented as Python None or PyQGIS NULL/QVariant.
+        for field_name in ("Travel_m", "Additional_m", "Percent_Increase"):
+            value = f[field_name]
+            is_null = (value is None or value == NULL or
+                       (hasattr(value, "isNull") and value.isNull()))
+            assert is_null, (f["Point_ID"], field_name, value)
+
+for f in summary_layer.getFeatures():
+    key = (str(f["Beach"]), int(f["Offset_deg"]), str(f["Direction"]))
+    recs = groups[key]
+    valid = [r for r in recs if r["Status"] == STATUS_VALID]
+    assert int(f["Total_n"]) == len(recs)
+    assert int(f["Valid_n"]) == len(valid)
+    assert int(f["Habitat_Cross_n"]) == sum(r["Status"] == STATUS_HABITAT for r in recs)
+    assert int(f["No_Intersection_n"]) == sum(r["Status"] == STATUS_NO_INTERSECTION for r in recs)
+    if valid:
+        for outfield, infield in [
+            ("Mean_Baseline_m", "Baseline_m"),
+            ("Mean_Travel_m", "Travel_m"),
+            ("Mean_Additional_m", "Additional_m"),
+            ("Mean_Percent_Increase", "Percent_Increase")
+        ]:
+            assert abs(float(f[outfield]) - mean(float(r[infield]) for r in valid)) < 0.0001
+
+print("\nRECONSTRUCTED 250 M ANALYSIS CHECK")
+print("---------------------------------")
+print("Starting points:", len(start_points))
+print("Total scenarios:", len(rows))
+print("Valid:", counts[STATUS_VALID])
+print("Habitat crossing:", counts[STATUS_HABITAT])
+print("No intersection <=500m:", counts[STATUS_NO_INTERSECTION])
+print("Summary rows:", summary_layer.featureCount())
+print("Noosa 2 m pilot flags:", noosa_2m_layer.featureCount())
+print("Cross-section geometric candidates:", cross_layer.featureCount())
+print("Summary counts and means: PASS")
+
+for label, actual, expected in [
+    ("points", len(start_points), EXPECTED["points"]),
+    ("rays", len(rows), EXPECTED["rays"]),
+    ("valid", counts[STATUS_VALID], EXPECTED["valid"]),
+    ("habitat", counts[STATUS_HABITAT], EXPECTED["habitat"]),
+    ("no_intersection", counts[STATUS_NO_INTERSECTION], EXPECTED["no_intersection"]),
+    ("summary", summary_layer.featureCount(), EXPECTED["summary"])
+]:
+    if actual != expected:
+        print("HISTORICAL COMPARISON WARNING: %s: rebuilt=%s, original=%s" %
+              (label, actual, expected))
+
+# ============================================================================
+# 11. PUBLISH REVIEW LAYERS; OPTIONAL SAFE EXPORT TO A NEW GEOPACKAGE
+# ============================================================================
+
+outputs = [points_layer, baselines_layer, beach_polygons, rays_layer,
+           intersection_layer, trim_layer, noosa_2m_layer, flags_layer,
+           cross_layer, qc_register, results_layer, summary_layer]
+
+for layer in outputs:
+    PROJECT.addMapLayer(layer)
+
+if OUTPUT_GPKG:
+    import os
+    if os.path.exists(OUTPUT_GPKG):
+        raise RuntimeError("Refusing to overwrite existing GeoPackage: " + OUTPUT_GPKG)
+    for i, layer in enumerate(outputs):
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.layerName = layer.name()
+        opts.actionOnExistingFile = (
+            QgsVectorFileWriter.CreateOrOverwriteFile if i == 0
+            else QgsVectorFileWriter.CreateOrOverwriteLayer
+        )
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(
+            layer, OUTPUT_GPKG, PROJECT.transformContext(), opts)
+        if result[0] != QgsVectorFileWriter.NoError:
+            raise RuntimeError("GeoPackage export failed: %s: %s" %
+                               (layer.name(), result))
+    print("Saved regenerated layers to NEW file:", OUTPUT_GPKG)
+else:
+    print("Review layers are TEMPORARY. Set OUTPUT_GPKG to a NEW path to export.")
+
+print("\nMETHODS REMINDER: imagery classification, narrow waterways, and habitat")
+print("boundaries require human review; geometric checks alone are not proof")
+print("of a biologically traversable route. Keep QC screenshots and decisions.")
+

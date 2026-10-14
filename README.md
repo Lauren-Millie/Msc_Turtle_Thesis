@@ -95,7 +95,12 @@ Msc_Turtle_Thesis/
 │
 ├── README.md
 │
+├── Distance Analysis
+│   └── 250m Spatial Scenario
+│
 ├── Power Analysis
+    ├── Between_Beaches
+    ├── Within_Beach
 │
 ├── data/
 │   └── VIIRS_data_manifest.csv

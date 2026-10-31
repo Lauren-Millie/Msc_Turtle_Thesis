@@ -1,0 +1,105 @@
+  Simulation_Results$Power[i] <- mean(detected)
+}
+print(Simulation_Results)
+write.csv(Simulation_Results,
+          file.path(output_dir, "Light_Barrier_Simulation_Results.csv"),
+          row.names = FALSE)
+
+Power_Summary <- Simulation_Results %>%
+  filter(Effect > 0) %>%
+  group_by(Variability, Effect) %>%
+  summarise(N_for_80_Percent = if (any(Power >= Target_Power))
+    min(Sample_Size[Power >= Target_Power]) else NA_real_, .groups = "drop")
+print(Power_Summary)
+write.csv(Power_Summary,
+          file.path(output_dir, "Light_Barrier_Sample_Size_Summary.csv"),
+          row.names = FALSE)
+
+False_Positive_Check <- Simulation_Results %>%
+  filter(Effect == 0) %>%
+  transmute(Variability, Sample_Size,
+            False_Positive_Rate_Percent = round(Power * 100, 2))
+print(False_Positive_Check)
+write.csv(False_Positive_Check,
+          file.path(output_dir, "Light_Barrier_False_Positive_Check.csv"),
+          row.names = FALSE)
+
+Power_Graph <- ggplot(
+  filter(Simulation_Results, Effect > 0),
+  aes(x = Sample_Size, y = Power * 100,
+      colour = factor(Effect), group = factor(Effect))
+) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  geom_hline(yintercept = 80, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~ Variability) +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +
+  labs(title = "Simulated power to detect differences in orientation offset",
+       x = "Total emergence events", y = "Statistical power (%)",
+       colour = "Assumed reduction (degrees)") +
+  theme_classic(base_size = 12)
+print(Power_Graph)
+ggsave(file.path(output_dir, "Light_Barrier_Power_Curve.png"),
+       Power_Graph, width = 10, height = 5, dpi = 300)
+
+# ------------------------------------------------------------
+# 4. Beach-stratified permutation validation
+# ------------------------------------------------------------
+# Retains the three original selected scenarios, with 500
+# datasets per scenario and 999 within-beach permutations.
+set.seed(456)
+Validation_Scenarios <- data.frame(
+  Effect = c(15, 12.94, 10),
+  Sample_Size = c(80, 100, 160)
+)
+Validation_N_Simulations <- 500L
+N_Permutations <- 999L
+
+permutation_p <- function(d, n_perm = N_Permutations) {
+  observed <- unname(coef(lm(Offset ~ Barrier + Beach, data = d))[
+    "BarrierLight barrier"])
+  permuted_effects <- replicate(n_perm, {
+    p <- d
+    # Permute barrier assignments independently within each beach.
+    p$Barrier <- factor(
+      ave(as.character(d$Barrier), d$Beach,
+          FUN = function(x) sample(x, length(x), replace = FALSE)),
+      levels = barrier_levels
+    )
+    unname(coef(lm(Offset ~ Barrier + Beach, data = p))[
+      "BarrierLight barrier"])
+  })
+  (sum(abs(permuted_effects) >= abs(observed)) + 1) / (n_perm + 1)
+}
+
+Validation_Results <- Validation_Scenarios
+Validation_Results$Permutation_Power <- NA_real_
+for (i in seq_len(nrow(Validation_Results))) {
+  scenario <- Validation_Results[i, ]
+  cat("Validating scenario", i, "of", nrow(Validation_Results), "\n")
+  detected <- replicate(Validation_N_Simulations, {
+    d <- generate_study(scenario$Sample_Size, scenario$Effect,
+                        Residual_SD, Beach_Means)
+    permutation_p(d) < Alpha
+  })
+  Validation_Results$Permutation_Power[i] <- mean(detected)
+}
+Original_Power <- Simulation_Results %>%
+  filter(Variability == "Observed variability") %>%
+  select(Effect, Sample_Size, Linear_Model_Power = Power)
+Validation_Results <- Validation_Results %>%
+  left_join(Original_Power, by = c("Effect", "Sample_Size")) %>%
+  mutate(
+    Permutation_Power_Percent = round(Permutation_Power * 100, 1),
+    Linear_Model_Power_Percent = round(Linear_Model_Power * 100, 1),
+    Difference_Percentage_Points = round(
+      Permutation_Power_Percent - Linear_Model_Power_Percent, 1)
+  )
+print(Validation_Results)
+write.csv(Validation_Results,
+          file.path(output_dir, "Light_Barrier_Permutation_Validation.csv"),
+          row.names = FALSE)
+
+# Record the R environment for auditing and reproducibility.
+writeLines(capture.output(sessionInfo()),
+           file.path(output_dir, "R_session_info.txt"))
+cat("Completed. Outputs saved in:", output_dir, "\n")
